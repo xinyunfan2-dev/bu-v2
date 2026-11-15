@@ -1,3 +1,4 @@
+import { searchPolicySources } from "./retrieval.js";
 import { ToolLoopAgent, isStepCount, tool, Output } from "ai";
 import { createDeepSeek } from "@ai-sdk/deepseek";
 import { z } from "zod";
@@ -124,8 +125,8 @@ export function sourceTools(snapshot: Snapshot, record: (name: string) => void, 
     listDocuments: tool({ description: "检查材料清单、角色和每份解析完整性。", inputSchema: z.object({}),
       execute: async () => { action("listDocuments"); return snapshot.documents; } }),
     searchSources: tool({ description: "查找条款关键词。可用短词并换词重试；无结果不证明不存在。", inputSchema: z.object({ query: z.string().min(1).max(150) }),
-      execute: async ({query}) => { action("searchSources"); const terms = query.split(/[\s,，;；]+/).map(normalize).filter(Boolean);
-        return expose(snapshot.sources.filter(s => terms.some(t => normalize(s.quote).includes(t))).slice(0, 8).map(s => trim(s, 320))); } }),
+      execute: async ({query}) => { action("searchSources");
+        return expose(searchPolicySources(snapshot.sources, query)); } }),
     readSource: tool({ description: "阅读一段原文及同页和相邻页的上下文，检查定义和除外。sourceId 必须来自 listDocuments/searchSources 的返回值。", inputSchema: z.object({sourceId: z.string()}),
       execute: async ({sourceId}) => { action("readSource"); const source = resolveSource(sourceId);
         if (!source) return { error: "SOURCE_NOT_IN_REVIEW",

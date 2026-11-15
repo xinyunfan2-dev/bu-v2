@@ -485,6 +485,8 @@ export function createApp(store: Store) {
       if (!closed) {
         const message = timeout.aborted
           ? (lang === "en" ? "This took too long. Please retry." : "處理超時，請重試。")
+          : error instanceof Error && error.message === "EVIDENCE_REVIEW_FAILED"
+            ? (lang === "en" ? "The evidence check could not verify the report. Please retry." : "未能核實報告的原文依據，請重試。")
           : error instanceof Error && error.message === "REPORT_GENERATION_FAILED"
             ? (lang === "en" ? "The AI reply came back garbled. Please retry." : "AI 回覆格式出錯，請重試。")
             : error instanceof Error ? error.message : "處理過程發生錯誤，請重試。";

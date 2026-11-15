@@ -71,3 +71,121 @@ test("toWrittenChinese rewrites Cantonese colloquialisms only", async () => {
   assert.equal(toWrittenChinese("屋企冇人，睇醫生唔賠嘅"), "家裏沒有人，看醫生不賠的");
   assert.equal(toWrittenChinese("門診每次只賠 150 元"), "門診每次只賠 150 元");
 });
+
+// Small gold retrieval set: relevant clauses deliberately occur after common distractors.
+import { searchPolicySources } from "../retrieval.js";
+import { reviewBeforePublish } from "../evidence-review.js";
+import { assertReviewedCitations } from "../v3.js";
+import { z } from "zod";
+
+const retrievalGold = [
+  { query: "家里没人", quote: "Loss while the home is unoccupied for over 30 days is excluded." },
+  { query: "延误", quote: "Flight delay of at least six hours is required." },
+  { query: "免赔", quote: "An excess of HKD 500 applies to each loss." },
+  { query: "索赔 证明", quote: "Claims require proof of purchase and a carrier certificate." },
+  { query: "批单", quote: "This endorsement changes the cover stated in the schedule." },
+];
+for (const fixture of retrievalGold) {
+  test(`retrieval gold: ${fixture.query} finds the bilingual clause`, () => {
+    const sources = Array.from({ length: 30 }, (_, i) => ({
+      sourceId: `doc:p${i + 1}:b1`, documentId: "doc", quote: `General policy introduction ${i}.`,
+    }));
+    sources.push({ sourceId: "doc:p99:b1", documentId: "doc", quote: fixture.quote });
+    assert.equal(searchPolicySources(sources, fixture.query)[0]?.sourceId, "doc:p99:b1");
+  });
+}
+
+test("retrieval ranks multiple concepts above early single-term hits and deduplicates", () => {
+  const sources = Array.from({ length: 12 }, (_, i) => ({ sourceId: `s${i}`, documentId: "d", quote: `Delay information ${i}` }));
+  sources.push({ sourceId: "relevant", documentId: "d", quote: "Delay claims require a certificate as proof." });
+  sources.push({ sourceId: "duplicate", documentId: "d", quote: "Delay claims require a certificate as proof." });
+  const hits = searchPolicySources(sources, "delay proof");
+  assert.equal(hits[0].sourceId, "relevant");
+  assert.ok(!hits.some(hit => hit.sourceId === "duplicate"));
+  assert.ok(hits.length <= 8);
+});
+
+test("retrieval keeps a late keyword visible as a verbatim substring", () => {
+  const quote = "General text. ".repeat(150) + "Flight delay requires six hours.";
+  const hits = searchPolicySources([{ sourceId: "late", documentId: "d", quote }], "delay");
+  assert.ok(hits[0].quote.includes("Flight delay"));
+  assert.ok(quote.includes(hits[0].quote));
+});
+
+test("retrieval does not match English keywords inside unrelated words or invent missing evidence", () => {
+  const sources = [{ sourceId: "d:1", documentId: "d", quote: "Disclaimer: contact details." }];
+  assert.deepEqual(searchPolicySources(sources, "claim"), []);
+  assert.deepEqual(searchPolicySources(sources, "flood"), []);
+  assert.deepEqual(searchPolicySources(sources, "  "), []);
+});
+
+const reviewedSchema = z.object({ answer: z.string() });
+test("review gate publishes only the corrected result, after review completes", async () => {
+  const published: unknown[] = [];
+  const result = await reviewBeforePublish({ schema: reviewedSchema, draft: { answer: "Always paid" },
+    signal: new AbortController().signal,
+    review: async draft => {
+      assert.equal(draft.answer, "Always paid");
+      assert.deepEqual(published, []);
+      return { answer: "Only if the stated conditions are met" };
+    }, publish: item => published.push(item),
+  });
+  assert.deepEqual(published, [result]);
+  assert.notEqual(result.answer, "Always paid");
+});
+
+test("review gate fails closed for unavailable, invalid, and unsupported evidence", async () => {
+  for (const failure of ["unavailable", "invalid", "evidence"]) {
+    const published: unknown[] = [];
+    await assert.rejects(reviewBeforePublish({ schema: reviewedSchema, draft: { answer: "Draft" },
+      signal: new AbortController().signal,
+      review: async () => { if (failure === "unavailable") throw new Error("offline"); return failure === "invalid" ? {} : { answer: "Reviewed" }; },
+      validate: () => { if (failure === "evidence") throw new Error("EVIDENCE_REVIEW_FAILED"); },
+      publish: item => published.push(item),
+    }));
+    assert.deepEqual(published, []);
+  }
+});
+
+test("review cancellation prevents publication before or during review", async () => {
+  for (const alreadyAborted of [true, false]) {
+    const controller = new AbortController();
+    if (alreadyAborted) controller.abort();
+    let calls = 0;
+    await assert.rejects(reviewBeforePublish({ schema: reviewedSchema, draft: { answer: "Draft" }, signal: controller.signal,
+      review: async () => { calls++; controller.abort(); return { answer: "Reviewed" }; },
+      publish: () => assert.fail("cancelled review must not publish"),
+    }));
+    assert.equal(calls, alreadyAborted ? 0 : 1);
+  }
+});
+
+test("reviewed citations reject invented wording and marketing used as contract evidence", () => {
+  const contract = [{ sourceId: "c:p7:b1", pageIndex: 7, quote: "Delays of six hours require a carrier certificate." }];
+  const promotion = [{ sourceId: "m:p1:b1", pageIndex: 1, quote: "Every delay is covered." }];
+  assert.doesNotThrow(() => assertReviewedCitations({ scenarios: [{ sourceId: "c:p7:b1", quote: "Delays of six hours" }] }, contract));
+  assert.throws(() => assertReviewedCitations({ sourceId: "c:p7:b1", quote: "Five hours always pays" }, contract), /EVIDENCE_REVIEW_FAILED/);
+  assert.throws(() => assertReviewedCitations({ contractSourceId: "m:p1:b1", contractQuote: promotion[0].quote }, contract, promotion), /EVIDENCE_REVIEW_FAILED/);
+  assert.doesNotThrow(() => assertReviewedCitations({ claimQuote: promotion[0].quote, contractSourceId: "c:p7:b1", contractQuote: "require a carrier certificate" }, contract, promotion));
+});
+
+test("review context includes adjacent exclusions and claims conditions beyond the short draft quote", async () => {
+  const { reviewEvidenceContext } = await import("../v3.js");
+  const sources = [
+    { sourceId: "c:p7:b1", documentId: "c", pageIndex: 7, role: "contract" as const, quote: "Delay benefit starts at six hours." },
+    { sourceId: "c:p8:b1", documentId: "c", pageIndex: 8, role: "contract" as const, quote: "No benefit for a cancelled flight." },
+    { sourceId: "c:p90:b1", documentId: "c", pageIndex: 90, role: "contract" as const, quote: "Claims require a carrier certificate." },
+  ];
+  const context = reviewEvidenceContext(sources, { sourceId: "c:p7:b1", quote: "Delay benefit" });
+  assert.deepEqual(new Set(context.map(src => src.sourceId)), new Set(sources.map(src => src.sourceId)));
+  assert.equal(new Set(context.map(src => src.sourceId)).size, context.length);
+});
+
+test("authoritative scenario, gap and claim classifications require citations", () => {
+  for (const result of [
+    { verdict: "supported", contractQuote: "" },
+    { hasGap: true, tableQuote: "", detailQuote: "" },
+    { status: "excluded", visualKind: "none", quote: "" },
+  ]) assert.throws(() => assertReviewedCitations(result, []), /EVIDENCE_REVIEW_FAILED/);
+  assert.doesNotThrow(() => assertReviewedCitations({ status: "ask", visualKind: "none", quote: "" }, []));
+});
